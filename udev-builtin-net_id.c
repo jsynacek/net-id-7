@@ -88,6 +88,7 @@
  *   ID_NET_NAME_PATH=enp0s29u1u2
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -99,9 +100,12 @@
 #include <net/if_arp.h>
 #include <linux/pci_regs.h>
 
-#include "udev.h"
-#include "fileio.h"
-#include "def.h"
+#include <dirent.h>
+#include <getopt.h>
+#include <stdint.h>
+#include "util.h"
+
+bool arg_do_virtio = false;
 
 #define ONBOARD_INDEX_MAX (16*1024-1)
 
@@ -180,7 +184,7 @@ static int dev_pci_onboard(struct udev_device *dev, struct netnames *names) {
 
 /* read the 256 bytes PCI configuration space to check the multi-function bit */
 static bool is_pci_multifunction(struct udev_device *dev) {
-        _cleanup_close_ int fd = -1;
+        int fd = -1;
         const char *filename;
         uint8_t config[64];
 
@@ -206,7 +210,7 @@ static int dev_pci_slot(struct udev_device *dev, struct netnames *names) {
         const char *attr;
         struct udev_device *pci = NULL;
         char slots[256], str[256];
-        _cleanup_closedir_ DIR *dir = NULL;
+        DIR *dir = NULL;
         struct dirent *dent;
         int hotplug_slot = 0, err = 0;
 
@@ -352,27 +356,13 @@ static int names_platform(struct udev_device *dev, struct netnames *names, bool 
 
 static int names_pci(struct udev_device *dev, struct netnames *names) {
         struct udev_device *parent;
-        static int do_virtio = -1;
-
-        if (do_virtio < 0) {
-                _cleanup_free_ char *value = NULL;
-                int n = 0;
-                do_virtio = 0;
-                if (get_proc_cmdline_key("net.ifnames", NULL) > 0)
-                        do_virtio = 1;
-                else if (get_proc_cmdline_key("net.ifnames=", &value) > 0) {
-                        safe_atoi(value, &n);
-                        if (n > 0)
-                                do_virtio = 1;
-                }
-        }
 
         parent = udev_device_get_parent(dev);
 
         /* there can only ever be one virtio bus per parent device, so we can
            safely ignore any virtio buses. see
            <http://lists.linuxfoundation.org/pipermail/virtualization/2015-August/030331.html> */
-        if (do_virtio > 0)
+        if (arg_do_virtio)
                 while (parent && streq_ptr("virtio", udev_device_get_subsystem(parent)))
                         parent = udev_device_get_parent(parent);
 
@@ -536,22 +526,6 @@ static int names_mac(struct udev_device *dev, struct netnames *names) {
         return 0;
 }
 
-/* IEEE Organizationally Unique Identifier vendor string */
-static int ieee_oui(struct udev_device *dev, struct netnames *names, bool test) {
-        char str[32];
-
-        if (!names->mac_valid)
-                return -ENOENT;
-        /* skip commonly misused 00:00:00 (Xerox) prefix */
-        if (memcmp(names->mac, "\0\0\0", 3) == 0)
-                return -EINVAL;
-        snprintf(str, sizeof(str), "OUI:%02X%02X%02X%02X%02X%02X",
-                 names->mac[0], names->mac[1], names->mac[2],
-                 names->mac[3], names->mac[4], names->mac[5]);
-        udev_builtin_hwdb_lookup(dev, NULL, str, NULL, test);
-        return 0;
-}
-
 static int builtin_net_id(struct udev_device *dev, int argc, char *argv[], bool test) {
         const char *s;
         const char *p;
@@ -603,8 +577,6 @@ static int builtin_net_id(struct udev_device *dev, int argc, char *argv[], bool 
                          names.mac[0], names.mac[1], names.mac[2],
                          names.mac[3], names.mac[4], names.mac[5]);
                 udev_builtin_add_property(dev, test, "ID_NET_NAME_MAC", str);
-
-                ieee_oui(dev, &names, test);
         }
 
         /* get path names for Linux on System z network devices */
@@ -687,8 +659,42 @@ out:
         return EXIT_SUCCESS;
 }
 
-const struct udev_builtin udev_builtin_net_id = {
-        .name = "net_id",
-        .cmd = builtin_net_id,
-        .help = "Network device properties",
-};
+int process_args(int argc, char *argv[]) {
+        struct option opts[] = {{NULL, no_argument, 0, 'n'}};
+        int opt;
+        while ((opt = getopt(argc, argv, "n")) != -1) {
+                if (opt == 'n')
+                        arg_do_virtio = true;
+                else
+                        goto usage;
+        }
+        if (optind >= argc)
+                goto usage;
+        return optind;
+usage:
+        fprintf(stderr, "usage: %s [-n] /sys/class/net/<interface>\n", argv[0]);
+        exit(EXIT_FAILURE);
+}
+
+/* In RHEL-7, the trailing slash breaks things for some reason. */
+char *remove_trailing_slash(char *s) {
+	int i = strlen(s) - 1;
+	if (s[i] == '/')
+		s[i] = '\0';
+	return s;
+}
+
+int main(int argc, char *argv[]) {
+        struct udev *udev;
+        struct udev_device *d;
+        int i;
+
+        i = process_args(argc, argv);
+        udev = udev_new();
+        d = udev_device_new_from_syspath(udev, remove_trailing_slash(argv[i]));
+        if (d == NULL) {
+                fprintf(stderr, "device not found\n");
+                return EXIT_FAILURE;
+        }
+        return builtin_net_id(d, 0, NULL, false);
+}
